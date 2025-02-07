@@ -2,7 +2,7 @@ import contextlib
 import dataclasses
 from collections import defaultdict
 from typing import DefaultDict, Dict
-
+import csv
 import torch
 
 import para_attn.primitives as DP
@@ -75,6 +75,11 @@ def cache_context(cache_context):
     finally:
         _current_cache_context = old_cache_context
 
+@torch.compiler.disable()
+def tensor_distance(t1, t2):
+    mean_diff = (t1 - t2).abs().mean()
+    mean_t1 = t1.abs().mean()
+    return mean_diff / mean_t1
 
 @torch.compiler.disable()
 def are_two_tensors_similar(t1, t2, *, threshold, parallelized=False):
@@ -105,7 +110,7 @@ def apply_prev_hidden_states_residual(hidden_states, encoder_hidden_states):
 
 @torch.compiler.disable()
 def get_can_use_cache(first_hidden_states_residual, threshold, parallelized=False):
-    prev_first_hidden_states_residual = get_buffer("first_hidden_states_residual")
+    prev_first_hidden_states_residual = get_buffer("hidden_states_residual_0")
     can_use_cache = prev_first_hidden_states_residual is not None and are_two_tensors_similar(
         prev_first_hidden_states_residual,
         first_hidden_states_residual,
@@ -131,6 +136,11 @@ class CachedTransformerBlocks(torch.nn.Module):
         self.single_transformer_blocks = single_transformer_blocks
         self.residual_diff_threshold = residual_diff_threshold
         self.return_hidden_states_first = return_hidden_states_first
+        # self.residual_diff_log = []
+        self.denoising_step = 0
+        self.csv_file = open("residuals.csv", "w")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["diffusion_step", "layer_ix", "residual"])
 
     def forward(self, hidden_states, encoder_hidden_states, *args, **kwargs):
         if self.residual_diff_threshold <= 0.0:
@@ -159,6 +169,12 @@ class CachedTransformerBlocks(torch.nn.Module):
         first_hidden_states_residual = hidden_states - original_hidden_states
         del original_hidden_states
 
+        # get residual difference
+        prev_residual_0 = get_buffer("hidden_states_residual_0")
+        if prev_residual_0 is not None:
+            residual_diff = tensor_distance(first_hidden_states_residual, prev_residual_0)
+            self.log_residual_difference(self.denoising_step, 0, residual_diff)
+
         can_use_cache = get_can_use_cache(
             first_hidden_states_residual,
             threshold=self.residual_diff_threshold,
@@ -172,7 +188,7 @@ class CachedTransformerBlocks(torch.nn.Module):
                 hidden_states, encoder_hidden_states
             )
         else:
-            set_buffer("first_hidden_states_residual", first_hidden_states_residual)
+            set_buffer("hidden_states_residual_0", first_hidden_states_residual)
             del first_hidden_states_residual
             (
                 hidden_states,
@@ -183,7 +199,8 @@ class CachedTransformerBlocks(torch.nn.Module):
             set_buffer("hidden_states_residual", hidden_states_residual)
             set_buffer("encoder_hidden_states_residual", encoder_hidden_states_residual)
         torch._dynamo.graph_break()
-
+        
+        self.denoising_step += 1
         return (
             (hidden_states, encoder_hidden_states)
             if self.return_hidden_states_first
@@ -193,8 +210,20 @@ class CachedTransformerBlocks(torch.nn.Module):
     def call_remaining_transformer_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
         original_hidden_states = hidden_states
         original_encoder_hidden_states = encoder_hidden_states
-        for block in self.transformer_blocks[1:]:
+        for ix, block in enumerate(self.transformer_blocks[1:]):
+            original_hidden_states = hidden_states
             hidden_states, encoder_hidden_states = block(hidden_states, encoder_hidden_states, *args, **kwargs)
+            hidden_states_residual = hidden_states - original_hidden_states
+            
+            # get residual difference
+            prev_hidden_states_residual = get_buffer(f"hidden_states_residual_{ix}")
+            if prev_hidden_states_residual is not None:
+                residual_diff = tensor_distance(hidden_states_residual, prev_hidden_states_residual)
+                self.log_residual_difference(self.denoising_step, ix + 1, residual_diff)
+            
+            set_buffer(f"hidden_states_residual_{ix}", hidden_states_residual)
+            del hidden_states_residual
+
             if not self.return_hidden_states_first:
                 hidden_states, encoder_hidden_states = encoder_hidden_states, hidden_states
         if self.single_transformer_blocks is not None:
@@ -216,3 +245,10 @@ class CachedTransformerBlocks(torch.nn.Module):
         hidden_states_residual = hidden_states - original_hidden_states
         encoder_hidden_states_residual = encoder_hidden_states - original_encoder_hidden_states
         return hidden_states, encoder_hidden_states, hidden_states_residual, encoder_hidden_states_residual
+    
+
+    def log_residual_difference(self, denoising_step, transformer_block_ix, residual_diff):
+        self.csv_writer.writerow([denoising_step, transformer_block_ix, residual_diff.item()])
+    
+    def __del__(self):
+        self.csv_file.close()
