@@ -123,7 +123,7 @@ parallelize_pipe(
 
 
 def generate(prompt, pipe, suffix):
-    torch.manual_seed(365)
+    gen = torch.Generator(device=pipe.device).manual_seed(42)
 
     output = pipe(
         prompt=prompt,
@@ -132,6 +132,7 @@ def generate(prompt, pipe, suffix):
         width=832,
         num_frames=81,
         num_inference_steps=30,
+        generator=gen,
         output_type="pil" if dist.get_rank() == 0 else "pt",
     ).frames[0]
 
@@ -144,23 +145,25 @@ def generate(prompt, pipe, suffix):
 lora_one_file = "./loras/wan_flat_color_v2.safetensors"
 lora_one_state_dict = _patch_convert_non_diffusers_wan_lora_to_diffusers(load_file(lora_one_file))
 
+world_size = torch.distributed.get_world_size()
+
 flat_prompt = "flat color 2d animation of a portrait of woman with white hair and green eyes, dynamic scene"
-# generate(flat_prompt, pipe, "no_flat_lora")
+generate(flat_prompt, pipe, f"no_lora_{world_size}_gpu")
 
 pipe.load_lora_weights(lora_one_state_dict)
-generate(flat_prompt, pipe, "flat_lora_2")
+generate(flat_prompt, pipe, f"flat_lora_{world_size}_gpu")
 
-pipe.unload_lora_weights()
-generate(flat_prompt, pipe, "no_flat_lora_again")
+# pipe.unload_lora_weights()
+# generate(flat_prompt, pipe, "no_flat_lora_again")
 
-# 'https://replicate.delivery/xezq/FbxX664a8aaoH1CLxHcM0lcegKStk0OaNCen0yufg2cGBovoA/trained_model.tar'
-lora_two_file = "./loras/sclera-lora/output/wan_train_replicate/lora.safetensors"
-lora_two_state_dict = _patch_convert_non_diffusers_wan_lora_to_diffusers(load_file(lora_two_file))
+# # 'https://replicate.delivery/xezq/FbxX664a8aaoH1CLxHcM0lcegKStk0OaNCen0yufg2cGBovoA/trained_model.tar'
+# lora_two_file = "./loras/sclera-lora/output/wan_train_replicate/lora.safetensors"
+# lora_two_state_dict = _patch_convert_non_diffusers_wan_lora_to_diffusers(load_file(lora_two_file))
 
-sclera_prompt = "an extreme close up of an epic cyberpunk woman with BLACK_SCLERA"
-generate(sclera_prompt, pipe, "no_sclera_lora")
+# sclera_prompt = "an extreme close up of an epic cyberpunk woman with BLACK_SCLERA"
+# generate(sclera_prompt, pipe, "no_sclera_lora")
 
-pipe.load_lora_weights(lora_two_state_dict)
-generate(sclera_prompt, pipe, "sclera_lora")
+# pipe.load_lora_weights(lora_two_state_dict)
+# generate(sclera_prompt, pipe, "sclera_lora")
 
-dist.destroy_process_group()
+# dist.destroy_process_group()
